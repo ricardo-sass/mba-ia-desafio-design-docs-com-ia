@@ -1,0 +1,171 @@
+schema: spec-driven
+
+context: |
+  # Identidade e objetivo do repositório
+  Este repositório é um desafio acadêmico de engenharia de software orientada por IA. A entrega é
+  exclusivamente documental: produzir um pacote profissional de design docs para adicionar um
+  Sistema de Webhooks de Notificação de Pedidos a um Order Management System (OMS) existente.
+  A aplicação atual funciona e serve como referência arquitetural; não implementar a feature nem
+  alterar `src/`, `prisma/`, `tests/`, configurações da aplicação ou `TRANSCRICAO.md`.
+
+  Todos os artefatos e explicações devem ser escritos em português do Brasil (pt-BR). Manter em
+  inglês apenas identificadores de código, nomes de arquivos, endpoints, headers HTTP, códigos de
+  erro e palavras-chave exigidas pelo formato OpenSpec.
+
+  # Fontes de verdade e rastreabilidade
+  Usar as fontes nesta ordem e finalidade:
+  1. `ENUNCIADO.md`: escopo da entrega, estrutura obrigatória e critérios de aceite.
+  2. `TRANSCRICAO.md`: requisitos, decisões, alternativas, exclusões e questões em aberto da feature.
+  3. Código existente em `src/`, `prisma/` e `tests/`: comportamento atual, padrões e pontos reais de
+     integração.
+  4. `package.json`, `tsconfig.json`, `.eslintrc.json`, `.prettierrc`, `vitest.config.ts` e
+     `docker-compose.yml`: stack, comandos e convenções verificáveis.
+
+  Não inventar requisitos, números, datas, endpoints, componentes ou decisões. Toda afirmação
+  relevante deve ser rastreável a um timestamp no formato `[hh:mm] Nome` da transcrição ou a um
+  caminho real do código. Quando algo não estiver decidido, registrá-lo como hipótese, questão em
+  aberto ou recomendação, nunca como requisito confirmado. Os documentos em `docs/` são entregáveis
+  em elaboração, não fontes primárias; conferir suas afirmações contra a transcrição e o código.
+
+  # Produto e domínio atuais
+  O OMS gerencia autenticação, usuários, clientes, produtos e pedidos. A API REST usa o prefixo
+  `/api/v1`. Usuários autenticam com JWT Bearer e possuem os papéis `ADMIN` ou `OPERATOR`.
+  Pedidos usam UUID, número `ORD-NNNNNN`, valores monetários em centavos e o ciclo de vida:
+  `PENDING -> PAID -> PROCESSING -> SHIPPED -> DELIVERED`, com cancelamento permitido a partir de
+  `PENDING`, `PAID` ou `PROCESSING`. A transição `PENDING -> PAID` debita estoque; cancelar a partir
+  de `PAID` ou `PROCESSING` o repõe. Mudança de status, histórico e efeitos no estoque ocorrem em
+  transação Prisma no método `OrderService.changeStatus`.
+
+  Estado atual importante: não existem webhooks, eventos, filas, outbox, DLQ ou mecanismo de
+  notificação externa. Qualquer referência a esses elementos descreve o estado futuro proposto.
+
+  # Stack e arquitetura existentes
+  - Runtime: Node.js >= 20, TypeScript 5.6, ECMAScript modules e target ES2022.
+  - API: Express 4.21, JSON limitado a 1 MB e composição manual de dependências em `src/app.ts`.
+  - Persistência: MySQL 8 via Prisma 5.22; schema em `prisma/schema.prisma` e migrações versionadas.
+  - Validação: Zod 3 nos arquivos `*.schemas.ts` e middleware `validate`.
+  - Segurança: JWT, bcrypt, middleware `authenticate` e autorização RBAC via `requireRole`.
+  - Erros: subclasses de `AppError`, middleware centralizado e envelope JSON
+    `{ error: { code, message, details? } }`.
+  - Observabilidade: logs estruturados com Pino, `requestId`/`X-Request-Id` e redação de segredos.
+  - Testes: Vitest + Supertest, testes de integração sequenciais contra MySQL e limpeza das tabelas
+    em `tests/setup.ts`; usar somente banco de teste isolado.
+  - Organização modular: `src/modules/<dominio>/` com controller, service, repository, routes e
+    schemas. Controllers encaminham erros com `next`, services concentram regras de negócio,
+    repositories encapsulam persistência e routes aplicam autenticação/validação.
+
+  Pontos de integração que devem ser conferidos no código:
+  - `src/modules/orders/order.service.ts`: fronteira transacional de `changeStatus`.
+  - `src/modules/orders/order.status.ts`: máquina de estados e efeitos de estoque.
+  - `src/app.ts` e `src/routes/index.ts`: composição e registro de módulos/rotas.
+  - `src/middlewares/auth.middleware.ts`: `authenticate` e `requireRole`.
+  - `src/middlewares/error.middleware.ts` e `src/shared/errors/`: contrato de erros.
+  - `src/shared/logger/index.ts` e `src/middlewares/request-logger.middleware.ts`: logging e correlação.
+  - `prisma/schema.prisma`: modelos, enums, índices, relações e padrão de UUID.
+
+  # Convenções técnicas
+  TypeScript estrito, incluindo `noUncheckedIndexedAccess`, `noImplicitOverride` e prevenção de
+  fallthrough. Preferir `import type`, evitar `any`, usar igualdade estrita e manter imports ESM com
+  extensão `.js`. Formatação: aspas simples, ponto e vírgula, trailing comma, largura 100, indentação
+  de 2 espaços e LF. Reutilizar os padrões existentes antes de propor abstrações ou dependências.
+
+  Comandos de qualidade disponíveis: `npm run build`, `npm run lint` e `npm test`. Os testes exigem
+  MySQL configurado e apagam dados das tabelas conhecidas; nunca executá-los contra banco compartilhado
+  ou de produção. `npm run db:reset` é destrutivo e não deve ser usado sem solicitação explícita.
+
+  # Feature alvo: webhooks outbound de mudança de status
+  Motivação: três clientes B2B querem deixar de consultar pedidos por polling. A expectativa de produto
+  é receber notificações em menos de 10 segundos. O fluxo é somente OMS -> cliente.
+
+  Decisões confirmadas na reunião:
+  - Transactional Outbox no MySQL existente. O snapshot JSON do evento entra na outbox na mesma
+    transação que altera pedido e histórico; falha na inserção causa rollback.
+  - Worker Node.js em processo separado, single-worker nesta fase, consultando pendências a cada 2 s.
+    O single-worker, sozinho, não preserva ordem durante backoff: eventos mais novos podem ultrapassar
+    um anterior. O FDD deve explicitar a limitação e propor isolamento por destino/pedido com sequência
+    monotônica para timestamps iguais; não há garantia global.
+  - Entrega at-least-once. UUID em `X-Event-Id` permite deduplicação pelo consumidor; exactly-once foi
+    descartado pela complexidade de coordenação.
+  - Retry limitado com cinco marcos temporais de 1 min, 5 min, 30 min, 2 h e 12 h. A transcrição é
+    ambígua entre cinco tentativas totais e uma tentativa inicial mais cinco retries; preservar essa
+    lacuna até confirmação. Após o esgotamento da política aprovada, persistir em tabela DLQ separada
+    e permitir replay manual por endpoint administrativo.
+  - HMAC-SHA256 sobre o corpo enviado, secret única por endpoint e rotação com coexistência da secret
+    anterior por 24 h. Se o desenho armazenar apenas secret atual/anterior, uma nova rotação durante
+    o grace period não pode substituir a anterior e encurtar sua validade. HTTPS obrigatório, timeout
+    de envio de 10 s e payload máximo de 64 KB; exceder o limite é erro, sem truncamento.
+  - Headers de entrega: `Content-Type: application/json`, `X-Event-Id`, `X-Signature`, `X-Timestamp`
+    e `X-Webhook-Id`.
+  - Evento `order.status_changed` com snapshot enxuto: event_id, event_type, timestamp ISO 8601,
+    order_id, order_number, from_status, to_status, customer_id e campos básicos como total_cents;
+    não incluir itens do pedido.
+  - CRUD autenticado de configurações de webhook, secret gerada pelo sistema e devolvida na criação,
+    filtro por status na inserção da outbox e rotação de secret. A consulta às 100 entregas mais
+    recentes expõe sucesso/falha, payload, resposta e latência. Replay da DLQ exige `ADMIN` e log de
+    auditoria.
+  - Novo domínio deve seguir `src/modules/webhooks`; o worker terá entry point separado equivalente a
+    `src/server.ts`, PrismaClient próprio do processo e reuso de Zod, AppError, Pino e middleware atual.
+    Códigos de erro do domínio usam prefixo `WEBHOOK_`. O middleware `validate` atual converte todo
+    `ZodError` em `VALIDATION_ERROR`; o FDD deve explicar uma tradução retrocompatível para produzir
+    erros específicos de URL/filtro sem mudar as rotas existentes.
+  - Estimativa registrada: três sprints, incluindo ao menos dois dias úteis para revisão de segurança
+    por Sofia antes do deploy.
+
+  Fora de escopo ou futuro: chamada HTTP síncrona dentro de `changeStatus`; Redis/infra adicional;
+  inbound webhooks; exactly-once; múltiplos workers e particionamento; email de alerta/fallback;
+  dashboard visual; rate limiting de saída nesta fase; arquivamento/limpeza da outbox entregue.
+
+  Pontos ainda não definidos incluem a contagem total da política de retry, tamanho do batch,
+  concorrência/locking, semântica exata de respostas HTTP retentáveis, armazenamento/criptografia das
+  secrets, forma canônica da assinatura, contrato final dos endpoints, posição de `customer_id` no
+  body ou path, política definitiva de retenção, métricas/SLOs detalhados e estratégia operacional de
+  deploy/rollback. Não decidir esses pontos silenciosamente nem tratá-los todos como bloqueios: retenção/
+  limpeza definitiva permanece fora da primeira fase; critérios operacionais devem ser fechados antes
+  do deploy; contratos que alteram comportamento devem ser aprovados antes do código correspondente.
+  Dois paths relativos foram verbalizados:
+  `GET /webhooks/:id/deliveries` e `POST /admin/webhooks/dead-letter/:id/replay`.
+
+  O RFC deve permanecer arquitetural e delegar ao FDD números de janela/lease e sintaxe de locking.
+  No FDD, separar o baseline confirmado `HMAC(rawBody)` da extensão proposta que inclui timestamp;
+  critérios derivados de defaults só são obrigatórios se a proposta correspondente for aprovada.
+  A meta inferior a 10 s precisa declarar carga, backlog e latência do destino e reconhecer o limite
+  do worker sequencial. A finalização de tentativa deve propor atomicidade entre delivery, estado e
+  eventual DLQ, com proteção contra finalizador de claim já recuperado.
+
+  # Entregáveis documentais do desafio
+  O pacote final esperado é `docs/PRD.md`, `docs/RFC.md`, `docs/FDD.md`, entre 5 e 8 ADRs MADR em
+  `docs/adrs/ADR-NNN-titulo-em-kebab-case.md`, `docs/TRACKER.md` e um `README.md` do processo. Evitar
+  duplicação: PRD responde por quê/o quê; RFC propõe a arquitetura e alternativas; ADR isola uma
+  decisão; FDD detalha como construir; Tracker prova a origem de cada item. Nos ADRs, contar e rastrear
+  separadamente a decisão principal, cada alternativa e cada consequência, qualificando inferências.
+  O Tracker deve cobrir ao menos 80% dos itens identificáveis, ter ao menos 70% das linhas originadas
+  na transcrição e ao menos cinco referências a caminhos reais do código. O percentual expressa
+  cobertura do inventário declarado, não prova autônoma de completude semântica; desagregar linhas
+  que combinem itens sustentados por timestamps diferentes.
+
+rules:
+  proposal:
+    - "Escrever integralmente em pt-BR e manter a proposta concisa, centrada no problema, valor, escopo e capacidades observáveis; deixar detalhes de implementação para o design."
+    - "Citar timestamps da transcrição e caminhos do código para sustentar motivação, impacto e restrições; não elevar hipóteses ou práticas de mercado a fatos do projeto."
+    - "Declarar explicitamente objetivos, não objetivos, dependências, riscos e questões ainda abertas, preservando as exclusões registradas na reunião."
+    - "Tratar a entrega como documentação apenas: nenhuma capacidade pode pressupor alteração imediata da aplicação durante este desafio."
+    - "Listar como capacidades somente comportamentos coesos que realmente exijam especificação própria e usar identificadores kebab-case estáveis."
+  specs:
+    - "Escrever o conteúdo em pt-BR, preservando as palavras-chave normativas MUST/SHALL e a sintaxe WHEN/THEN exigidas pelo OpenSpec."
+    - "Expressar requisitos testáveis e sem ambiguidade; cada requisito deve ter cenários de sucesso e, quando aplicável, validação, autorização, falha, retry ou limite."
+    - "Distinguir estado atual de comportamento futuro e não preencher lacunas do contrato com valores não confirmados; registrar a lacuna para decisão."
+    - "Cobrir explicitamente atomicidade da outbox, at-least-once, deduplicação, filtros, segurança HMAC/TLS, retry/DLQ, autorização e limites quando pertencentes à capacidade."
+    - "Manter nomes de endpoints, headers, status, payloads e códigos de erro consistentes entre todas as capacidades e com as fontes primárias."
+  design:
+    - "Escrever em pt-BR e fundamentar cada decisão relevante com timestamp da transcrição e/ou caminho real do código; separar decisão confirmada, recomendação e questão em aberto."
+    - "Mapear arquitetura atual e futura sem afirmar que componentes de webhook já existem; mostrar processo da API, transação MySQL/outbox, processo worker e endpoint externo."
+    - "Detalhar limites transacionais, modelo de dados, estados, polling/locking, retry/DLQ, idempotência, HMAC/rotação de secret, observabilidade e integração com os padrões existentes."
+    - "Para cada decisão, registrar motivação, alternativa considerada e trade-off; não reabrir silenciosamente decisões fechadas na reunião."
+    - "Incluir riscos e mitigação, estratégia de testes, migração, deploy/rollback e revisão de segurança; manter os pontos sem evidência como questões abertas."
+    - "Não propor dependência ou infraestrutura nova sem demonstrar necessidade e impacto, pois o baseline decidido privilegia MySQL, Prisma, Pino, Zod e processos Node.js existentes."
+  tasks:
+    - "Criar apenas tarefas documentais dentro do escopo do desafio; não incluir implementação ou alteração em `src/`, `prisma/`, `tests/`, configurações da aplicação ou `TRANSCRICAO.md`."
+    - "Usar rigorosamente checkboxes `- [ ] X.Y`, grupos numerados e ordem por dependência; cada tarefa deve caber em uma sessão e ter resultado verificável."
+    - "Ordenar a produção preferencialmente como decisões/ADRs, RFC, FDD, PRD, Tracker e README, incluindo revisão cruzada de consistência ao final."
+    - "Incluir tarefas explícitas para rastreabilidade, validação de caminhos citados, cobertura dos critérios de aceite do `ENUNCIADO.md` e revisão contra a transcrição."
+    - "Não marcar uma tarefa como concluída sem conferir o arquivo gerado e executar as validações não destrutivas aplicáveis."
